@@ -94,6 +94,7 @@ export function ThreadItem({
 
   // Build hover tooltip: full title + participants + time (clowder-ai#29)
   const displayTitle = title ?? (id === 'default' ? '大厅' : '未命名对话');
+  const hasDraft = !isActive && (threadState?.hasDraft ?? false);
   const participantNames = participants.map((catId) => getCatById(catId)?.displayName ?? catId).join(', ');
   const tooltipLines = [displayTitle];
   if (participantNames) tooltipLines.push(`参与: ${participantNames}`);
@@ -262,7 +263,17 @@ export function ThreadItem({
               className="flex items-center gap-0.5 ml-1"
               title={`默认: ${preferredCats.map((id) => getCatById(id)?.displayName ?? id).join(', ')}`}
             >
-              <span className="text-[9px] text-cafe-muted">🎯</span>
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-2.5 w-2.5 text-cafe-muted shrink-0"
+              >
+                <path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12zM12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z" />
+              </svg>
               {preferredCats.map((catId) => (
                 <span
                   key={catId}
@@ -280,7 +291,10 @@ export function ThreadItem({
             />
           )}
         </div>
-        <span className="text-[10px] text-cafe-muted flex-shrink-0">{formatRelativeTime(lastActiveAt, true)}</span>
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          {hasDraft && <span className="text-[10px] font-medium text-red-500">[草稿]</span>}
+          <span className="text-[10px] text-cafe-muted">{formatRelativeTime(lastActiveAt, true)}</span>
+        </div>
       </div>
     </div>
   );

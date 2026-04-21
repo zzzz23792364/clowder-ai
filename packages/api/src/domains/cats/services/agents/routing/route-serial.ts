@@ -13,9 +13,20 @@
 import type { CatConfig, CatId } from '@cat-cafe/shared';
 import { CAT_CONFIGS, catRegistry } from '@cat-cafe/shared';
 import { getCatContextBudget } from '../../../../../config/cat-budgets.js';
-import { getConfigSessionStrategy, isSessionChainEnabled } from '../../../../../config/cat-config-loader.js';
+import { getConfigSessionStrategy, getRoster, isSessionChainEnabled } from '../../../../../config/cat-config-loader.js';
 import { getCatVoice } from '../../../../../config/cat-voices.js';
 import { createModuleLogger } from '../../../../../infrastructure/logger.js';
+import {
+  inlineActionChecked,
+  inlineActionDetected,
+  inlineActionFeedbackWriteFailed,
+  inlineActionFeedbackWritten,
+  inlineActionHintEmitFailed,
+  inlineActionHintEmitted,
+  inlineActionRoutedSetSkip,
+  inlineActionShadowMiss,
+  lineStartDetected,
+} from '../../../../../infrastructure/telemetry/instruments.js';
 import { detectUserMention } from '../../../../../routes/user-mention.js';
 import { estimateTokens } from '../../../../../utils/token-counter.js';
 import {
@@ -41,8 +52,9 @@ import { invokeSingleCat } from '../invocation/invoke-single-cat.js';
 import { buildMcpCallbackInstructions, needsMcpInjection } from '../invocation/McpPromptInjector.js';
 import { getRichBlockBuffer } from '../invocation/RichBlockBuffer.js';
 import { resolveDefaultClaudeMcpServerPath } from '../providers/ClaudeAgentService.js';
-import { detectInlineActionMentions, getMaxA2ADepth, parseA2AMentions } from '../routing/a2a-mentions.js';
-import { registerWorklist, unregisterWorklist } from '../routing/WorklistRegistry.js';
+import { detectInlineActionMentionsWithShadow, getMaxA2ADepth, parseA2AMentions } from '../routing/a2a-mentions.js';
+import { checkRoleCompat, type RoleLookup } from '../routing/role-gate.js';
+import { registerWorklist, unregisterWorklist, updateStreakOnPush } from '../routing/WorklistRegistry.js';
 import { extractContextEvalSignals } from './context-eval.js';
 import { buildBriefingMessage } from './format-briefing.js';
 import { extractRichFromText, isValidRichBlock } from './rich-block-extract.js';
@@ -55,6 +67,7 @@ import {
   isUserFacingSystemInfoContent,
   routeContentBlocksForCat,
   sanitizeInjectedContent,
+  shouldAppendExplicitCurrentMessage,
   toStoredToolEvent,
   upsertMaxBoundary,
 } from './route-helpers.js';
@@ -148,7 +161,7 @@ export async function* routeSerial(
     }
   }
 
-  // F155: Guide interceptor — resolve existing state + match new candidates
+  // F155: Guide interceptor — resume existing guide state only
   const guideCtx = await prepareGuideContext({
     thread: routeThread,
     guideSessionStore: deps.invocationDeps.guideSessionStore,
@@ -157,7 +170,6 @@ export async function* routeSerial(
     userId,
     threadId,
     log,
-    dismissTracker: deps.invocationDeps.dismissTracker,
   });
 
   try {
@@ -184,6 +196,15 @@ export async function* routeSerial(
         catRegistry.tryGet(catId as string)?.config ?? CAT_CONFIGS[catId as string];
       const teammates = [...new Set(worklist.filter((id) => id !== catId))];
       const directMessageFrom = worklistEntry.a2aFrom.get(catId);
+      // F167 L1: ping-pong warning — inject when this cat just received the ball
+      // in a same-pair streak >= 2 (streak=4 already blocked upstream, so max is 3 here).
+      const pingPongWarning =
+        worklistEntry.streakPair && worklistEntry.streakPair.to === catId && worklistEntry.streakPair.count >= 2
+          ? {
+              pairedWith: worklistEntry.streakPair.from,
+              count: worklistEntry.streakPair.count,
+            }
+          : undefined;
       const streamReplyTo = worklistEntry.a2aTriggerMessageId.get(catId);
       const streamReplyPreview = streamReplyTo
         ? await hydrateReplyPreview(deps.messageStore, streamReplyTo)
@@ -207,7 +228,7 @@ export async function* routeSerial(
       }
       const staticIdentity = buildStaticIdentity(catId, { mcpAvailable, packBlocks });
       // F041: inject HTTP callback only when MCP is NOT actually available (fallback)
-      const mcpInstructions = needsMcpInjection(mcpAvailable)
+      const mcpInstructions = needsMcpInjection(mcpAvailable, catConfig?.clientId)
         ? buildMcpCallbackInstructions({
             currentCatId: catId as string,
             teammates: teammates.map((id) => id as string),
@@ -234,6 +255,31 @@ export async function* routeSerial(
         }
       }
 
+      // F163 AC-A3: always_on constitutional docs injection (fail-open, flag-gated)
+      // shadow: query but do NOT inject into prompt (record-only for experiment diff)
+      // on: query AND inject into prompt
+      // off: skip entirely
+      let alwaysOnDocs: readonly { anchor: string; title: string; summary: string }[] | undefined;
+      let alwaysOnInjectionMode: 'off' | 'shadow' | 'on' = 'off';
+      if (deps.evidenceStore) {
+        try {
+          const { freezeFlags } = await import('../../../../../domains/memory/f163-types.js');
+          const f163Flags = freezeFlags();
+          alwaysOnInjectionMode = f163Flags.alwaysOnInjection;
+          if (alwaysOnInjectionMode !== 'off') {
+            const queryAlwaysOn = (
+              deps.evidenceStore as { queryAlwaysOn?: () => Array<{ anchor: string; title: string; summary: string }> }
+            ).queryAlwaysOn;
+            if (queryAlwaysOn) {
+              const docs = queryAlwaysOn();
+              if (docs.length > 0) alwaysOnDocs = docs;
+            }
+          }
+        } catch {
+          /* fail-open: always_on lookup failure does not block invocation */
+        }
+      }
+
       const invocationContext = buildInvocationContext({
         catId,
         mode: worklist.length > 1 ? 'serial' : 'independent',
@@ -244,6 +290,7 @@ export async function* routeSerial(
         ...(promptTags && promptTags.length > 0 ? { promptTags } : {}),
         a2aEnabled: worklistEntry.a2aCount < maxDepth,
         ...(directMessageFrom ? { directMessageFrom } : {}),
+        ...(pingPongWarning ? { pingPongWarning } : {}),
         ...(mentionRoutingFeedback ? { mentionRoutingFeedback } : {}),
         ...(activeParticipants.length > 0 ? { activeParticipants } : {}),
         ...(routingPolicy ? { routingPolicy } : {}),
@@ -251,6 +298,7 @@ export async function* routeSerial(
         ...(activeSignals ? { activeSignals } : {}),
         ...(voiceMode ? { voiceMode } : {}),
         ...(bootcampState ? { bootcampState, threadId } : {}),
+        ...(alwaysOnDocs && alwaysOnInjectionMode === 'on' ? { alwaysOnDocs } : {}),
         ...guideContextForCat(guideCtx, catId, targetCatIds, threadId),
       });
 
@@ -354,8 +402,9 @@ export async function* routeSerial(
         const parts = [invocationContext, catModePrompt, bootstrapContext, mcpInstructions].filter(Boolean);
         if (inc.contextText) parts.push(inc.contextText);
         // F35 fix: only inject raw message when it was genuinely absent from unseen rows.
-        // If it was present but filtered out (e.g. whisper), injecting would leak private content.
-        if (!inc.includesCurrentUserMessage && !inc.currentMessageFilteredOut) parts.push(message);
+        // Defensive guard: if the current message ID is already present anywhere in
+        // the assembled context text, do not append the raw message again.
+        if (shouldAppendExplicitCurrentMessage(inc, currentUserMessageId)) parts.push(message);
         prompt = parts.join('\n\n---\n\n');
       } else {
         // Per-cat context budget (Phase 4.0): assemble context with cat-specific limits
@@ -717,37 +766,60 @@ export async function* routeSerial(
         // Line-start @mention = always actionable (no keyword gate)
         a2aMentions = parseA2AMentions(storedContent, catId);
 
+        // clowder-ai#489: baseline counter — line-start mentions
+        if (a2aMentions.length > 0) {
+          lineStartDetected.add(a2aMentions.length, { 'agent.id': catId as string });
+        }
+
         // #417 / F064 AC-B3: Write-side feedback for inline action-like @mentions
+        // clowder-ai#489: counters for detection, shadow, feedback, hint
         if (deps.invocationDeps.threadStore) {
-          const inlineHits = detectInlineActionMentions(storedContent, catId, a2aMentions);
+          const {
+            strictHits: inlineHits,
+            shadowMisses,
+            routedSetSkips,
+          } = detectInlineActionMentionsWithShadow(storedContent, catId, a2aMentions);
+          const agentAttr = { 'agent.id': catId as string };
+          inlineActionChecked.add(1, agentAttr);
+          if (inlineHits.length > 0) inlineActionDetected.add(inlineHits.length, agentAttr);
+          if (shadowMisses.length > 0) inlineActionShadowMiss.add(shadowMisses.length, agentAttr);
+          if (routedSetSkips > 0) inlineActionRoutedSetSkip.add(routedSetSkips, agentAttr);
+
           if (inlineHits.length > 0) {
             try {
               await deps.invocationDeps.threadStore.setMentionRoutingFeedback(threadId, catId, {
                 sourceTimestamp: Date.now(),
                 items: inlineHits.map((m) => ({ targetCatId: m.catId, reason: 'inline_action' as const })),
               });
+              inlineActionFeedbackWritten.add(1, agentAttr);
               log.info(
                 { catId: catId as string, threadId, targets: inlineHits.map((h) => h.catId) },
                 'Inline action @mention detected — wrote routing feedback',
               );
             } catch {
-              /* best-effort */
+              inlineActionFeedbackWriteFailed.add(1, agentAttr);
             }
             // #1062: User-visible system message when chain would break
             // (inline action detected but no line-start @ = no routing will happen)
             if (a2aMentions.length === 0) {
               try {
                 const targets = inlineHits.map((h) => `@${h.catId}`).join(', ');
-                const hintSource = { connector: 'inline-mention-hint', label: 'Routing hint', icon: 'lightbulb' };
+                const hintSource = {
+                  connector: 'inline-mention-hint',
+                  label: '路由提示',
+                  icon: '💡',
+                  meta: { presentation: 'system_notice', noticeTone: 'info' },
+                };
                 const stored = await deps.messageStore.append({
                   userId: 'system',
                   catId: null,
                   threadId,
-                  content: `💡 ${targets} was mentioned but not routed — @ must be on its own line at the start to trigger handoff.`,
+                  content: `想交接给 ${targets}？把它单独放到新起一行开头，才能触发交接。`,
                   mentions: [],
                   timestamp: Date.now(),
                   source: hintSource,
                 });
+                inlineActionHintEmitted.add(1, agentAttr);
                 // Broadcast so frontend sees it in real-time (same pattern as vote result)
                 if (deps.socketManager) {
                   deps.socketManager.broadcastToRoom(`thread:${threadId}`, 'connector_message', {
@@ -762,7 +834,7 @@ export async function* routeSerial(
                   });
                 }
               } catch {
-                /* best-effort */
+                inlineActionHintEmitFailed.add(1, agentAttr);
               }
             }
           }
@@ -940,6 +1012,12 @@ export async function* routeSerial(
         if (a2aMentions.length > 0 && worklistEntry.a2aCount < maxDepth && !signal?.aborted && !queuedMessagesPending) {
           const pendingTail = worklist.slice(index + 1);
           const pendingOriginalTargets = targetCats.slice(index + 1);
+          // F167 L3 AC-A7: lazy-init role lookup once per routeSerial call when a handoff is in play.
+          const roster = getRoster();
+          const roleLookup: RoleLookup = (cid) => {
+            const entry = roster[cid];
+            return entry ? { roles: entry.roles } : undefined;
+          };
           for (const nextCat of a2aMentions) {
             if (worklistEntry.a2aCount >= maxDepth) break;
             // A2A cross-path dedup: skip if this cat is actively processing via callback (InvocationQueue)
@@ -957,6 +1035,51 @@ export async function* routeSerial(
                 // F121: response-text path — set trigger message for auto-replyTo
                 if (storedMsgId) worklistEntry.a2aTriggerMessageId.set(nextCat, storedMsgId);
               }
+              continue;
+            }
+            // F167 L3: reject handoff when target role cannot accept the action (MVP: designer + coding).
+            // MUST run AFTER dedup checks — otherwise we emit a rejection for a cat that's already
+            // pending as an original target (contradictory: event says rejected but cat still executes).
+            const gate = checkRoleCompat(nextCat, storedContent, roleLookup);
+            if (!gate.allowed) {
+              log.info(
+                { threadId, catId: nextCat, fromCat: catId, action: gate.action, reason: gate.reason },
+                'F167 L3: A2A handoff rejected by role-gate (role/action mismatch)',
+              );
+              yield {
+                type: 'system_info' as AgentMessageType,
+                catId,
+                content: JSON.stringify({
+                  type: 'a2a_role_rejected',
+                  targetCatId: nextCat,
+                  fromCatId: catId,
+                  action: gate.action,
+                  reason: gate.reason,
+                }),
+                timestamp: Date.now(),
+              } as AgentMessage;
+              continue;
+            }
+
+            // F167 L1: ping-pong streak check (canonical enqueue point).
+            // streak=4+ → block enqueue + emit a2a_pingpong_terminated.
+            const streak = updateStreakOnPush(worklistEntry, catId, nextCat);
+            if (streak.blockPingPong) {
+              log.info(
+                { threadId, catId: nextCat, fromCat: catId, count: streak.count },
+                'F167 L1: A2A ping-pong terminated (streak >= 4)',
+              );
+              yield {
+                type: 'system_info' as AgentMessageType,
+                catId,
+                content: JSON.stringify({
+                  type: 'a2a_pingpong_terminated',
+                  fromCatId: catId,
+                  targetCatId: nextCat,
+                  pairCount: streak.count,
+                }),
+                timestamp: Date.now(),
+              } as AgentMessage;
               continue;
             }
 
@@ -1197,7 +1320,7 @@ export async function* routeSerial(
       // rounds (bug: "砚砚每次都疯狂回之前的消息").
       if (incrementalMode && deliveryBoundaryId) {
         if (options.cursorBoundaries) {
-          // ADR-008 S3: defer ack — caller acks after invocation succeeds
+          // ADR-008 S3: defer ack — caller acks after completion (or on abort/exception)
           upsertMaxBoundary(options.cursorBoundaries, catId, deliveryBoundaryId);
         } else if (deps.deliveryCursorStore) {
           // Legacy: ack immediately (deprecated route() path)
